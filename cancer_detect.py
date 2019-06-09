@@ -11,7 +11,7 @@ from tensorflow.data.experimental import AUTOTUNE
 import itchat
 tf.enable_eager_execution()
 count=0
-
+num_gpu=2
 itchat.auto_login(enableCmdQR=2)
 
 def read_image(path,label):
@@ -75,29 +75,30 @@ def get_data(is_train):
     if is_train:
 
         labels=[]
-        for img_path in image_path_list[0:len(image_path_list)-500]:
+        for img_path in image_path_list[0:len(image_path_list)-600]:
             img_name=img_path.split('/')[-1].split('.')[0]
             if label_dict[img_name]=='1':
                 labels.append([1,0])
             else:
                 labels.append([0,1])
 
-        return image_path_list[0:len(image_path_list)-500],labels
+        return image_path_list[0:len(image_path_list)-600],labels
     else:
         labels=[]
-        for img_path in image_path_list[len(image_path_list)-500:]:
+        for img_path in image_path_list[len(image_path_list)-600:]:
             img_name=img_path.split('/')[-1].split('.')[0]
             if label_dict[img_name]=='1':
                 labels.append([1,0])
             else:
                 labels.append([0,1])
-        return image_path_list[len(image_path_list)-500:],labels
+        return image_path_list[len(image_path_list)-600:],labels
 #os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 import numpy as np
 import tensorflow as tf
 
 train_image,train_label =get_data(True)
 test_image,test_label= get_data(False)
+print(len(test_label))
 label_count = 2
 print("load data complete!")
 
@@ -182,104 +183,151 @@ def average_gradients(tower_grads):
 
 def feed_all_gpu(inp_dict,models,payload_per_gpu,batch_x,batch_y):
     for i in range(len(models)):
-        x,y=models[i]
-        start_pos=i*payload_per_gpu
-        stop_pos=(i+1)*payload_per_gpu
+        x,y,_,_,_=models[i]
+        start_pos=int(i*payload_per_gpu)
+        stop_pos=int((i+1)*payload_per_gpu)
         inp_dict[x]=batch_x[start_pos:stop_pos]
         inp_dict[y]=batch_y[start_pos:stop_pos]
     return inp_dict
-def run_model(image_dim, label_count, depth):
-    weight_decay = 1e-4
+def run_model(image_dim, label_count, depth,xs,keep_prob,is_training):
     layers =int((depth - 4) / 3)
+    current = tf.reshape(xs, [-1, 96, 96, 3])
+    current = conv2d(current, 3, 16, 3)
+    current, features = block(current, layers, 16, 12, is_training, keep_prob)
+    current = batch_activ_conv(current, features, features, 1, is_training, keep_prob)
+    current = avg_pool(current, 2)
+    current, features = block(current, layers, features, 12, is_training, keep_prob)
+    current = batch_activ_conv(current, features, features, 1, is_training, keep_prob)
+    current = avg_pool(current, 2)
+    current, features = block(current, layers, features, 12, is_training, keep_prob)
+    current = tf.contrib.layers.batch_norm(current, scale=True, is_training=is_training, updates_collections=None)
+    current = tf.nn.relu(current)
+    current = avg_pool(current, 8)
+    final_dim = features*9
+    current = tf.reshape(current, [-1, final_dim])
+    Wfc = weight_variable([final_dim, label_count])
+    bfc = bias_variable([label_count])
+    ys_ = tf.nn.softmax(tf.matmul(current, Wfc) + bfc)
+    return ys_
+
+def train(image_dim,label_count,depth):
+
     graph = tf.Graph()
-    with graph.as_default():
-
-        filenames=tf.placeholder('string',shape=[None,])
-        xs = tf.placeholder("float", shape=[None, 96,96,3])
-        ys = tf.placeholder("float", shape=[None, label_count])
-        lr = tf.placeholder("float", shape=[])
-
-        keep_prob = tf.placeholder(tf.float32)
-        is_training = tf.placeholder("bool", shape=[])
-
-        current = tf.reshape(xs, [-1, 96, 96, 3])
-        current = conv2d(current, 3, 16, 3)
-
-        current, features = block(current, layers, 16, 12, is_training, keep_prob)
-        current = batch_activ_conv(current, features, features, 1, is_training, keep_prob)
-        current = avg_pool(current, 2)
-        current, features = block(current, layers, features, 12, is_training, keep_prob)
-        current = batch_activ_conv(current, features, features, 1, is_training, keep_prob)
-        current = avg_pool(current, 2)
-        current, features = block(current, layers, features, 12, is_training, keep_prob)
-
-        current = tf.contrib.layers.batch_norm(current, scale=True, is_training=is_training, updates_collections=None)
-        current = tf.nn.relu(current)
-        current = avg_pool(current, 8)
-        final_dim = features*9
-        current = tf.reshape(current, [-1, final_dim])
-        Wfc = weight_variable([final_dim, label_count])
-        bfc = bias_variable([label_count])
-        ys_ = tf.nn.softmax(tf.matmul(current, Wfc) + bfc)
-        cross_entropy = -tf.reduce_mean(ys * tf.log(ys_ + 1e-12))
-        l2 = tf.add_n([tf.nn.l2_loss(var) for var in tf.trainable_variables()])
-        train_step = tf.train.MomentumOptimizer(lr, 0.9, use_nesterov=True).minimize(cross_entropy + l2 * weight_decay)
-        correct_prediction = tf.equal(tf.argmax(ys_, 1), tf.argmax(ys, 1))
-        accuracy = tf.reduce_mean(tf.cast(correct_prediction, "float"))
     config = tf.ConfigProto(gpu_options=tf.GPUOptions(allow_growth=True))
     with tf.Session(graph=graph,config=config) as session:
-        #dataset = tf.data.Dataset.from_tensor_slices(train_image,train_label).map(read_image,num_parallel_calls=AUTOTUNE).batch(50).shuffle(500000).prefetch(buffer_size=AUTOTUNE)
+        with tf.device('/cpu:0'):
+            print('build model ...')
+            print('build model on gpu tower ...')
+        models=[]
 
+        lr = tf.placeholder("float", shape=[])
+        keep_prob = tf.placeholder(tf.float32)
+        is_training = tf.placeholder("bool", shape=[])
+        train_step = tf.train.MomentumOptimizer(lr, 0.9, use_nesterov=True)
+        for gpu_id in range(num_gpu):
+            with tf.device('/gpu:%d'% gpu_id):
+                print('tower:%d...'%gpu_id)
+                with tf.name_scope('tower_%d'%gpu_id):
+                    filenames=tf.placeholder('string',shape=[None,],name='filename')
+                    xs = tf.placeholder("float", shape=[None, 96,96,3],name='xs')
+                    ys = tf.placeholder("float", shape=[None, label_count],name='ys')
+                    ys_=run_model(image_dim,label_count,depth,xs,keep_prob,is_training)
+                    cross_entropy = -tf.reduce_mean(ys * tf.log(ys_ + 1e-12))
+                    l2 = tf.add_n([tf.nn.l2_loss(var) for var in tf.trainable_variables()])
+                    weight_decay = 1e-4
+                    losses=cross_entropy + l2 * weight_decay
+                    grads=train_step.compute_gradients(losses)
+                    models.append((xs,ys,ys_,losses,grads))
+        print('build model on gpu tower done ...')
+
+        print('reduce model on cpu ...')
+        tower_x,tower_y,tower_preds,tower_losses,tower_grads=zip(*models)
+        aver_loss_op=tf.reduce_mean(tower_losses)
+        apply_gradient_op=train_step.apply_gradients(average_gradients(tower_grads))
+        all_y=tf.reshape(tf.stack(tower_y,0),[-1,2])
+        all_pred=tf.reshape(tf.stack(tower_preds,0),[-1,2])
+        correct_prediction = tf.equal(tf.argmax(all_y, 1), tf.argmax(all_pred, 1))
+        accuracy = tf.reduce_mean(tf.cast(correct_prediction, "float"))
+        print('reduce model on cpu done...')
+
+        print('run train op...')
+        session.run(tf.global_variables_initializer())
         def yield_train_data():
             for image in train_image:
                 yield image
         def yield_test_data():
             for image in test_image:
                 yield image
-        #dataset = dataset.shuffle(20500).batch(10).repeat(10)
-        #dataset_t = tf.data.Dataset.from_tensor_slices((xs,ys))
-        dataset = tf.data.Dataset.from_tensor_slices((filenames,ys)).map(read_image,num_parallel_calls=AUTOTUNE).shuffle(220000).batch(100).repeat(100).prefetch(buffer_size=AUTOTUNE)
-        dataset_t = tf.data.Dataset.from_tensor_slices((filenames,ys)).map(read_image,num_parallel_calls=AUTOTUNE).shuffle(500).batch(100).repeat(100).prefetch(buffer_size=AUTOTUNE)
-        #dataset_t = Dataset_t.shuffle(500).batch(10)
+        batch_size =200
+        dataset = tf.data.Dataset.from_tensor_slices((filenames,ys)).map(read_image,num_parallel_calls=AUTOTUNE).repeat(10000).batch(batch_size).prefetch(buffer_size=AUTOTUNE)
+        dataset_t = tf.data.Dataset.from_tensor_slices((filenames,ys)).map(read_image,num_parallel_calls=AUTOTUNE).repeat(10000).batch(200).prefetch(buffer_size=AUTOTUNE)
+
         iterator = dataset.make_initializable_iterator()
         iterator_t = dataset_t.make_initializable_iterator()
-        batch_size = 64
         learning_rate = 0.1
-        session.run(tf.global_variables_initializer())
         session.run(iterator.initializer,feed_dict={filenames:train_image,ys:train_label})
         session.run(iterator_t.initializer,feed_dict={filenames:test_image,ys:test_label})
 
         saver = tf.train.Saver()
         d = iterator.get_next()
         d_t = iterator_t.get_next()
+
         max_test_accuracy=0
-        for epoch in range(1, 1 +300):
+        for epoch in range(1, 1 +10000):
+            print('epoch: ',epoch)
+            payload_per_gpu=batch_size/num_gpu
             if epoch == 150: learning_rate = 0.01
             if epoch == 225: learning_rate = 0.001
-            for batch_idx in range(700):
+            avg_loss=0.0
+            for batch_idx in range(1000):
+                if(batch_idx%100==0):
+                    print('>>>',batch_idx)
                 xs_, ys_ = session.run(d)
-                batch_res = session.run([train_step, cross_entropy, accuracy],
-                                        feed_dict={xs: xs_, ys: ys_, lr: learning_rate, is_training: True,
-                                                  keep_prob: 0.8})
-                if batch_idx % 100 == 0:
-                    print('**---training---**')
-                    print('-------------------------------')
-                    print('epoch:',epoch,'/','batch_idx:', batch_idx,'/','train_step,cross_entropy,accuracy:', batch_res[1:])
+                input_dict={}
+                input_dict[lr]=learning_rate
+                input_dict[is_training]=True
+                input_dict[keep_prob]=0.8
 
-            save_path = saver.save(session, 'densenet_%d.ckpt' % epoch)
+                input_dict=feed_all_gpu(input_dict,models,payload_per_gpu,xs_,ys_)
+                _,_loss=session.run([apply_gradient_op,aver_loss_op],input_dict)
+                avg_loss+=_loss
 
-            xs_t,ys_t=session.run(d_t)
-            test_results = run_in_batch_avg(session, [cross_entropy, accuracy], [xs, ys],
-                                            feed_dict={xs: xs_t, ys: ys_t,
-                                                       is_training: False, keep_prob:1.})
+            avg_loss/=1000
+            print('Train loss:%.4f'%avg_loss)
+            val_payload_per_gpu=batch_size/num_gpu
+            preds=None
+            y=None
 
-            print('**---validating---**')
-            print('-------------------------------')
-            print(epoch, batch_res[1:], test_results)
-            if test_results[1]>max_test_accuracy and test_results[1]!=1.0:
-                max_test_accuracy=test_results[1]
+            for batch_idx in range(3):
+                xs_t,ys_t=session.run(d_t)
+                input_dict={}
+                input_dict[is_training]=False
+                input_dict[keep_prob]=1.0
+                input_dict=feed_all_gpu(input_dict,models,val_payload_per_gpu,xs_t,ys_t)
+                _pred,_ys=session.run([all_pred,all_y],input_dict)
+
+                if preds is None:
+                    preds=_pred
+                else:
+                    preds=np.concatenate((preds,_pred),0)
+                if y is None:
+                    y=_ys
+                else:
+                    y=np.concatenate((y,_ys),0)
+            val_accuracy=session.run([accuracy],{all_y:y,all_pred:preds})[0]
+            if val_accuracy> max_test_accuracy:
+                max_test_accuracy=val_accuracy
                 time_now=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                itchat.send(time_now+'\n'+'epoch: '+str(epoch)+'\n accuracy: %.4f'%max_test_accuracy,toUserName='filehelper')
+                users = itchat.search_friends(name='种菜的小朋友')
+                print(users)
+                userName = users[0]['UserName']
+                itchat.send(time_now+'\n'+'epoch :'+str(epoch)+'\n'+'accuracy: %0.4f'%(100.0*max_test_accuracy),toUserName='filehelper')
+            print('Val accuracy: %0.4f%%'%(100.0*val_accuracy))
+            if epoch %100 ==0:
+                save_path = saver.save(session, 'densenet_%d.ckpt' % epoch)
+
+        print('train done')
+
 
 
 
@@ -287,8 +335,8 @@ def run():
     image_size = 96
     image_dim = image_size * image_size * 3
 
-    run_model(image_dim,2,20)
-    itchat.logout()
+    train(image_dim,2,20)
+    #itchat.logout()
 
 
 run()
