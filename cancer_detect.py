@@ -259,8 +259,8 @@ def train(image_dim,label_count,depth):
             for image in test_image:
                 yield image
         batch_size =200
-        dataset = tf.data.Dataset.from_tensor_slices((filenames,ys)).map(read_image,num_parallel_calls=AUTOTUNE).repeat(10000).batch(batch_size).prefetch(buffer_size=AUTOTUNE)
-        dataset_t = tf.data.Dataset.from_tensor_slices((filenames,ys)).map(read_image,num_parallel_calls=AUTOTUNE).repeat(10000).batch(200).prefetch(buffer_size=AUTOTUNE)
+        dataset = tf.data.Dataset.from_tensor_slices((filenames,ys)).map(read_image,num_parallel_calls=AUTOTUNE).shuffle(300000).repeat(10000).batch(batch_size).prefetch(buffer_size=AUTOTUNE)
+        dataset_t = tf.data.Dataset.from_tensor_slices((filenames,ys)).map(read_image,num_parallel_calls=AUTOTUNE).shuffle(600).repeat(10000).batch(batch_size).prefetch(buffer_size=AUTOTUNE)
 
         iterator = dataset.make_initializable_iterator()
         iterator_t = dataset_t.make_initializable_iterator()
@@ -276,12 +276,10 @@ def train(image_dim,label_count,depth):
         for epoch in range(1, 1 +10000):
             print('epoch: ',epoch)
             payload_per_gpu=batch_size/num_gpu
-            if epoch == 150: learning_rate = 0.01
-            if epoch == 225: learning_rate = 0.001
+            if epoch == 3000: learning_rate = 0.01
+            if epoch == 7000: learning_rate = 0.001
             avg_loss=0.0
             for batch_idx in range(1000):
-                if(batch_idx%100==0):
-                    print('>>>',batch_idx)
                 xs_, ys_ = session.run(d)
                 input_dict={}
                 input_dict[lr]=learning_rate
@@ -298,7 +296,7 @@ def train(image_dim,label_count,depth):
             preds=None
             y=None
 
-            for batch_idx in range(3):
+            for batch_idx in range(2):
                 xs_t,ys_t=session.run(d_t)
                 input_dict={}
                 input_dict[is_training]=False
@@ -318,9 +316,6 @@ def train(image_dim,label_count,depth):
             if val_accuracy> max_test_accuracy:
                 max_test_accuracy=val_accuracy
                 time_now=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                users = itchat.search_friends(name='种菜的小朋友')
-                print(users)
-                userName = users[0]['UserName']
                 itchat.send(time_now+'\n'+'epoch :'+str(epoch)+'\n'+'accuracy: %0.4f'%(100.0*max_test_accuracy),toUserName='filehelper')
             print('Val accuracy: %0.4f%%'%(100.0*val_accuracy))
             if epoch %100 ==0:
